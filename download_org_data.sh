@@ -12,21 +12,23 @@ for cmd in curl jq go; do
 done
 
 usage() {
-	echo "usage: $0 dir image[:tag][@digest] ..."
-	echo "       $0 /tmp/old-hello-world hello-world:latest@sha256:8be990ef2aeb16dbcb9271ddfe2610fa6658d13f6dfb8bc72074cc1ca36966a7"
+	echo "usage: $0 image[:tag][@digest] ..."
+	echo "       $0 hello-world:latest@sha256:8be990ef2aeb16dbcb9271ddfe2610fa6658d13f6dfb8bc72074cc1ca36966a7"
 	[ -z "$1" ] || exit "$1"
 }
 
-baseDir="$1" # root dir for building tar in
-shift || usage 1 >&2
+# get absolute paths of image and blob directories
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+imageDir="${SCRIPT_DIR}/images" # root dir for building tar in
+blobDir="${SCRIPT_DIR}/blobs" # root dir for storing blobs
 
-# create download directory
-[ $# -gt 0 -a "$baseDir" ] || usage 2 >&2
-mkdir -p "$baseDir"
+# create image directory
+[ $# -gt 0 -a "$imageDir" ] || usage 2 >&2
+mkdir -p "$imageDir"
 
 # hacky workarounds for Bash 3 support (no associative arrays)
 images=()
-rm -f "$baseDir"/tags-*.tmp
+rm -f "$imageDir"/tags-*.tmp
 manifestJsonEntries=()
 doNotGenerateManifestJson=
 newlineIFS=$'\n'
@@ -72,12 +74,10 @@ fetch_blob() {
 
 # check digest (exists if available)
 check_digest() {
-	
-
 	if [ "$(docker images --no-trunc $image | grep $digestString | grep -c $digest)" -ne "0" ]; then
 		echo "Image ${image}:${digest} (${digestString}) already present"
 		echo "${digestString}"
-		docker save $image | gzip > "$baseDir/$image-$digestString.tar.gz"
+		#docker save $image | gzip > "$imageDir/$image-$digestString.tar.gz"
 		exit 0
 	fi
 }
@@ -159,7 +159,9 @@ handle_single_manifest_v2() {
 					continue
 				fi
 				local token="$(curl -fsSL "$authBase/token?service=$authService&scope=repository:$image:pull" | jq --raw-output '.token')"
-				fetch_blob "$token" "$image" "$layerDigest" "$dir/$layerTar" --progress-bar
+				mkdir -p "$blobDir/$layerId"
+				fetch_blob "$token" "$image" "$layerDigest" "$blobDir/$layerTar" --progress-bar
+				ln -s "$blobDir/$layerTar" "$dir/$layerTar"
 				;;
 
 			*)
@@ -233,7 +235,7 @@ while [ $# -gt 0 ]; do
 					digestString="$(echo "$manifestJson" | jq --raw-output '.config.digest')"
 					echo "Checking ${digestString}"
 					check_digest "$digestString"	
-					dir="${baseDir}/${digestString:7:12}"
+					dir="${imageDir}/${digestString:7:12}"
 					mkdir -p "${dir}"
 					handle_single_manifest_v2 "$manifestJson"
 					;;
@@ -251,7 +253,7 @@ while [ $# -gt 0 ]; do
 						if [ "$maniArch" = "$(go env GOARCH)" ]; then
 							digest="$(echo "$layerMeta" | jq --raw-output '.digest')"
 							check_digest "$digest"
-							dir="${baseDir}/${digest:7:12}"
+							dir="${imageDir}/${digest:7:12}"
 							mkdir -p "${dir}"
 							# get second level single manifest
 							submanifestJson="$(
@@ -322,12 +324,12 @@ fi
 
 # pack downloaded image into tar file
 echo "SAVING $image to $dir ($digestString)..."
-tar -czC $dir . > $baseDir/${digestString:7:12}.tgz
+tar -czhC $dir . > $imageDir/${digestString:7:12}.tgz
 #&& rm -rf $dir
 
 # remove temporary directory
-#echo "Removing ${baseDir}..."
-#rm -rf "$baseDir"
+#echo "Removing ${imageDir}..."
+#rm -rf "$imageDir"
 
 echo "DONE"
 echo "${digestString}"
