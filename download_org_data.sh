@@ -28,15 +28,13 @@ mkdir -p "$imageDir"
 
 # hacky workarounds for Bash 3 support (no associative arrays)
 images=()
-rm -f "$imageDir"/tags-*.tmp
 manifestJsonEntries=()
-doNotGenerateManifestJson=
 newlineIFS=$'\n'
 registryBase='https://registry-1.docker.io'
 authBase='https://auth.docker.io'
 authService='registry.docker.io'
 
-# https://github.com/moby/moby/issues/33700
+# Fetch an image layer blob
 fetch_blob() {
 	local token="$1"
 	shift
@@ -72,16 +70,6 @@ fetch_blob() {
 	fi
 }
 
-# check digest (exists if available)
-check_digest() {
-	if [ "$(docker images --no-trunc $image | grep $digestString | grep -c $digest)" -ne "0" ]; then
-		echo "Image ${image}:${digest} (${digestString}) already present"
-		echo "${digestString}"
-		#docker save $image | gzip > "$imageDir/$image-$digestString.tar.gz"
-		exit 0
-	fi
-}
-
 # handle 'application/vnd.docker.distribution.manifest.v2+json' manifest
 handle_single_manifest_v2() {
 	local manifestJson="$1"
@@ -90,6 +78,7 @@ handle_single_manifest_v2() {
 	local configDigest="$(echo "$manifestJson" | jq --raw-output '.config.digest')"
 	local imageId="${configDigest#*:}" # strip off "sha256:"
 
+	# fetch config
 	local configFile="$imageId.json"
 	fetch_blob "$token" "$image" "$configDigest" "$dir/$configFile" -s
 
@@ -104,14 +93,17 @@ handle_single_manifest_v2() {
 	for i in "${!layers[@]}"; do
 		local layerMeta="${layers[$i]}"
 
+		# get the layer's media type and digest
 		local layerMediaType="$(echo "$layerMeta" | jq --raw-output '.mediaType')"
 		local layerDigest="$(echo "$layerMeta" | jq --raw-output '.digest')"
 
 		# save the previous layer's ID
 		local parentId="$layerId"
 		# create a new fake layer ID based on this layer's digest and the previous layer's fake ID
-		layerId="$(echo "$parentId"$'\n'"$layerDigest" | shasum -a 256 | cut -d' ' -f1)"
 		# this accounts for the possibility that an image contains the same layer twice (and thus has a duplicate digest value)
+		layerId="$(echo "$parentId"$'\n'"$layerDigest" | shasum -a 256 | cut -d' ' -f1)"
+
+		echo "Handling layer $((i+1))/${#layers[@]}: $layerId"
 
 		mkdir -p "$dir/$layerId"
 		echo '1.0' > "$dir/$layerId/VERSION"
@@ -150,16 +142,13 @@ handle_single_manifest_v2() {
 			application/vnd.docker.image.rootfs.diff.tar.gzip)
 				local layerTar="$layerId/layer.tar"
 				layerFiles=("${layerFiles[@]}" "$layerTar")
-				# TODO figure out why "-C -" doesn't work here
-				# "curl: (33) HTTP server doesn't seem to support byte ranges. Cannot resume."
-				# "HTTP/1.1 416 Requested Range Not Satisfiable"
 				if [ -f "$dir/$layerTar" ]; then
-					# TODO hackpatch for no -C support :'(
 					echo "skipping existing ${layerId:0:12}"
 					continue
 				fi
 				local token="$(curl -fsSL "$authBase/token?service=$authService&scope=repository:$image:pull" | jq --raw-output '.token')"
 				mkdir -p "$blobDir/$layerId"
+				# download blob into blob directory and link into image dir (maximise reuse or large layer blobs)
 				fetch_blob "$token" "$image" "$layerDigest" "$blobDir/$layerTar" --progress-bar
 				ln -s "$blobDir/$layerTar" "$dir/$layerTar"
 				;;
@@ -186,136 +175,120 @@ handle_single_manifest_v2() {
 		}'
 	)"
 	manifestJsonEntries=("${manifestJsonEntries[@]}" "$manifestJsonEntry")
+
 }
 
-while [ $# -gt 0 ]; do
-	imageTag="$1"
-	shift
-	image="${imageTag%%[:@]*}"
-	imageTag="${imageTag#*:}"
-	digest="${imageTag##*@}"
-	tag="${imageTag%%@*}"
+### main loop
+imageTag="$1"
+shift
+image="${imageTag%%[:@]*}"
+imageTag="${imageTag#*:}"
+digest="${imageTag##*@}"
+tag="${imageTag%%@*}"
 
-	# add prefix library if passed official image
-	if [[ "$image" != *"/"* ]]; then
-		image="library/$image"
-	fi
+# add prefix library if passed official image
+if [[ "$image" != *"/"* ]]; then
+	image="library/$image"
+fi
 
-	imageFile="${image//\//_}" # "/" can't be in filenames :)
+imageFile="${image//\//_}" # "/" can't be in filenames :)
+# echo $imageFile
+# exit 1
 
-	# get access token
-	token="$(curl -fsSL "$authBase/token?service=$authService&scope=repository:$image:pull" | jq --raw-output '.token')"
+# get access token
+token="$(curl -fsSL "$authBase/token?service=$authService&scope=repository:$image:pull" | jq --raw-output '.token')"
 
-	# get manifest
-	manifestJson="$(
-		curl -fsSL \
-			-H "Authorization: Bearer $token" \
-			-H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
-			-H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
-			-H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \
-			"$registryBase/v2/$image/manifests/$digest"
-	)"
-	
-	if [ "${manifestJson:0:1}" != '{' ]; then
-		echo >&2 "error: /v2/$image/manifests/$digest returned something unexpected:"
-		echo >&2 "  $manifestJson"
-		exit 1
-	fi
+# get manifest
+manifestJson="$(
+	curl -fsSL \
+		-H "Authorization: Bearer $token" \
+		-H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+		-H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+		-H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \
+		"$registryBase/v2/$image/manifests/$digest"
+)"
+if [ "${manifestJson:0:1}" != '{' ]; then
+	echo >&2 "error: /v2/$image/manifests/$digest returned something unexpected:"
+	echo >&2 "  $manifestJson"
+	exit 1
+fi
 
-	imageIdentifier="$image:$tag@$digest"
-	
-	# download accoding to schemaVersion
-	schemaVersion="$(echo "$manifestJson" | jq --raw-output '.schemaVersion')"
-	case "$schemaVersion" in
-		2)
-			mediaType="$(echo "$manifestJson" | jq --raw-output '.mediaType')"
+imageNameTag="$image:$tag"
+imageIdentifier="$imageNameTag@$digest"
 
-			case "$mediaType" in
-				application/vnd.docker.distribution.manifest.v2+json)
-					digestString="$(echo "$manifestJson" | jq --raw-output '.config.digest')"
-					echo "Checking ${digestString}"
-					check_digest "$digestString"	
-					dir="${imageDir}/${digestString:7:12}"
-					mkdir -p "${dir}"
-					handle_single_manifest_v2 "$manifestJson"
-					;;
-				application/vnd.docker.distribution.manifest.list.v2+json)
-					layersFs="$(echo "$manifestJson" | jq --raw-output --compact-output '.manifests[]')"
-					IFS="$newlineIFS"
-					layers=($layersFs)
-					unset IFS
+# download accoding to schemaVersion
+schemaVersion="$(echo "$manifestJson" | jq --raw-output '.schemaVersion')"
+case "$schemaVersion" in
+	2)
+		mediaType="$(echo "$manifestJson" | jq --raw-output '.mediaType')"
 
-					found=""
-					# parse first level multi-arch manifest
-					for i in "${!layers[@]}"; do
-						layerMeta="${layers[$i]}"
-						maniArch="$(echo "$layerMeta" | jq --raw-output '.platform.architecture')"
-						if [ "$maniArch" = "$(go env GOARCH)" ]; then
-							digest="$(echo "$layerMeta" | jq --raw-output '.digest')"
-							check_digest "$digest"
-							dir="${imageDir}/${digest:7:12}"
-							mkdir -p "${dir}"
-							# get second level single manifest
-							submanifestJson="$(
-								curl -fsSL \
-									-H "Authorization: Bearer $token" \
-									-H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
-									-H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
-									-H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \
-									"$registryBase/v2/$image/manifests/$digest"
-							)"
-							handle_single_manifest_v2 "$submanifestJson"
-							found="found"
-							break
-						fi
-					done
-					if [ -z "$found" ]; then
-						echo >&2 "error: manifest for $maniArch is not found"
-						exit 1
+		case "$mediaType" in
+			application/vnd.docker.distribution.manifest.v2+json)
+				digestString="$(echo "$manifestJson" | jq --raw-output '.config.digest')"
+				echo "Checking ${digestString}"
+				dir="${imageDir}/${digestString:7:12}"
+				mkdir -p "${dir}"
+				handle_single_manifest_v2 "$manifestJson"
+				;;
+			application/vnd.docker.distribution.manifest.list.v2+json)
+				layersFs="$(echo "$manifestJson" | jq --raw-output --compact-output '.manifests[]')"
+				IFS="$newlineIFS"
+				layers=($layersFs)
+				unset IFS
+
+				found=""
+				# parse first level multi-arch manifest
+				for i in "${!layers[@]}"; do
+					layerMeta="${layers[$i]}"
+					maniArch="$(echo "$layerMeta" | jq --raw-output '.platform.architecture')"
+					if [ "$maniArch" = "$(go env GOARCH)" ]; then
+						digest="$(echo "$layerMeta" | jq --raw-output '.digest')"
+						dir="${imageDir}/${digest:7:12}"
+						mkdir -p "${dir}"
+						# get second level single manifest
+						submanifestJson="$(
+							curl -fsSL \
+								-H "Authorization: Bearer $token" \
+								-H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+								-H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+								-H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \
+								"$registryBase/v2/$image/manifests/$digest"
+						)"
+						handle_single_manifest_v2 "$submanifestJson"
+						found="found"
+						break
 					fi
-					;;
-				*)
-					echo >&2 "error: unknown manifest mediaType ($imageIdentifier): '$mediaType'"
+				done
+				if [ -z "$found" ]; then
+					echo >&2 "error: manifest for $maniArch is not found"
 					exit 1
-					;;
-			esac
-			;;
-		*)
-			echo >&2 "error: unknown manifest schemaVersion ($imageIdentifier): '$schemaVersion'"
-			exit 1
-			;;
-	esac
+				fi
+				;;
+			*)
+				echo >&2 "error: unknown manifest mediaType ($imageIdentifier): '$mediaType'"
+				exit 1
+				;;
+		esac
+		;;
+	*)
+		echo >&2 "error: unknown manifest schemaVersion ($imageIdentifier): '$schemaVersion'"
+		exit 1
+		;;
+esac
 
-	echo
-
-	if [ -s "$dir/tags-$imageFile.tmp" ]; then
-		echo -n ', ' >> "$dir/tags-$imageFile.tmp"
+# if manifest.json exists, add an entry for the image we just downloaded
+if [ -f "$dir/manifest.json" ]; then
+	# check if current tag exists else add
+	tagIndex=$(cat $dir/manifest.json | jq --raw-output --arg TAG $imageNameTag '.[0].RepoTags | index($TAG)')
+	if [[ "$tagIndex" != "null" ]]; then
+		echo "Tag $imageNameTag already exists ($tagIndex)"
 	else
-		images=("${images[@]}" "$image")
+		echo "Adding tag $imageNameTag"
+		# add tag to manifest.json
+		cat $dir/manifest.json | jq --raw-output --arg TAG $imageNameTag '.[0].RepoTags[.[0].RepoTags | length] += $TAG' > $dir/amended_manifest.json && mv $dir/amended_manifest.json $dir/manifest.json
 	fi
-	echo -n '"'"$tag"'": "'"$imageId"'"' >> "$dir/tags-$imageFile.tmp"
-done
-
-# build repositories file
-echo -n '{' > "$dir/repositories"
-firstImage=1
-for image in "${images[@]}"; do
-	imageFile="${image//\//_}" # "/" can't be in filenames :)
-	image="${image#library\/}"
-
-	[ "$firstImage" ] || echo -n ',' >> "$dir/repositories"
-	firstImage=
-	echo -n $'\n\t' >> "$dir/repositories"
-	echo -n '"'"$image"'": { '"$(cat "$dir/tags-$imageFile.tmp")"' }' >> "$dir/repositories"
-done
-echo -n $'\n}\n' >> "$dir/repositories"
-
-rm -f "$dir"/tags-*.tmp
-
-if [ -z "$doNotGenerateManifestJson" ] && [ "${#manifestJsonEntries[@]}" -gt 0 ]; then
+elif [ "${#manifestJsonEntries[@]}" -gt 0 ]; then
 	echo '[]' | jq --raw-output ".$(for entry in "${manifestJsonEntries[@]}"; do echo " + [ $entry ]"; done)" > "$dir/manifest.json"
-else
-	rm -f "$dir/manifest.json"
 fi
 
 # import image
@@ -323,8 +296,8 @@ fi
 #tar -cC "$dir" . | docker load
 
 # pack downloaded image into tar file
-echo "SAVING $image to $dir ($digestString)..."
-tar -czhC $dir . > $imageDir/${digestString:7:12}.tgz
+# echo "SAVING $image to $dir ($digestString)..."
+# tar -czhC $dir . > $imageDir/${digestString:7:12}.tgz
 #&& rm -rf $dir
 
 # remove temporary directory
