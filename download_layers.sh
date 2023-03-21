@@ -141,15 +141,19 @@ handle_single_manifest_v2() {
 		case "$layerMediaType" in
 			application/vnd.docker.image.rootfs.diff.tar.gzip)
 				local layerTar="$layerId/layer.tar"
+				# echo $(ls -l $blobDir/$layerTar)
 				layerFiles=("${layerFiles[@]}" "$layerTar")
-				if [ -f "$dir/$layerTar" ]; then
+				if [ -e "$blobDir/$layerTar" ]; then
 					echo "skipping existing ${layerId:0:12}"
 					continue
+				else
+					local token="$(curl -fsSL "$authBase/token?service=$authService&scope=repository:$image:pull" | jq --raw-output '.token')"
+					mkdir -p "$blobDir/$layerId"
+					# download blob into blob directory and link into image dir (maximise reuse or large layer blobs)
+					fetch_blob "$token" "$image" "$layerDigest" "$blobDir/$layerTar" --progress-bar
 				fi
-				local token="$(curl -fsSL "$authBase/token?service=$authService&scope=repository:$image:pull" | jq --raw-output '.token')"
-				mkdir -p "$blobDir/$layerId"
-				# download blob into blob directory and link into image dir (maximise reuse or large layer blobs)
-				fetch_blob "$token" "$image" "$layerDigest" "$blobDir/$layerTar" --progress-bar
+				# link the blob into the image directory
+				rm -f "$dir/$layerTar"	
 				ln -s "$blobDir/$layerTar" "$dir/$layerTar"
 				;;
 
@@ -207,6 +211,9 @@ manifestJson="$(
 		-H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \
 		"$registryBase/v2/$image/manifests/$digest"
 )"
+
+
+
 if [ "${manifestJson:0:1}" != '{' ]; then
 	echo >&2 "error: /v2/$image/manifests/$digest returned something unexpected:"
 	echo >&2 "  $manifestJson"
