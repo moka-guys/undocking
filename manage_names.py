@@ -1,4 +1,4 @@
-#!/urs/bin/env python
+#!/usr/bin/env python
 
 import os
 import sys
@@ -53,7 +53,6 @@ def main(root, registry, write=False, show=False):
 
 
 if __name__=='__main__':
-    registry = sys.argv[1]
     # parse command line arguments with argparse
     argparser = ArgumentParser(description="Add registry to manifest.json files and report conflicts")
     argparser.add_argument('--add', help='registry to add', default=None)
@@ -64,4 +63,4 @@ if __name__=='__main__':
 
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), args.root)
 
-    main(root, registry, args.write, args.show)
+    main(root, args.add, args.write, args.show)
