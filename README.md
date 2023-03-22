@@ -74,8 +74,8 @@ Steps 1 and 3 can be tested with the `validate_tarballs.sh`.
 
 ### Push images back to registry
 
-***Not implemented***
-
 This pushes the images to th remote registries with a _load-push-remove_ cycle.
+
+NB: this will ignore images that have the same tag as local images to avoid them being overwritten.
 
 `push_images.sh`
